@@ -12,6 +12,10 @@ from matplotlib.lines import Line2D
 from PyQt5.QtCore import pyqtSignal
 
 from .ecdf import GroupECDF, proportions_at, stats_legend_text
+from .fonts import configure_matplotlib_fonts
+
+# Ensure CJK glyphs render on titles / legends / annotations.
+configure_matplotlib_fonts()
 
 
 COLORS = [
