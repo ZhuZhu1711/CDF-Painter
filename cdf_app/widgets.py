@@ -85,11 +85,20 @@ class SearchableComboBox(QComboBox):
         self.showPopup()
 
     def _on_activated(self, index: int) -> None:
-        # Keep the chosen label in the line edit, then reset filter
+        # Keep the chosen label in the line edit, then reset filter.
+        # Resolve via source model so clearing the filter cannot remap the
+        # selection to a different row (e.g. filtered index 0 →「无」).
         if 0 <= index < self._proxy.rowCount():
-            label = self._proxy.index(index, 0).data(Qt.DisplayRole)
-            if self.lineEdit() and label is not None:
+            proxy_index = self._proxy.index(index, 0)
+            src = self._proxy.mapToSource(proxy_index)
+            label = self._model.data(src, Qt.DisplayRole)
+            data = self._model.data(src, Qt.UserRole)
+            self._proxy.set_query("")
+            if data is not None or src.isValid():
+                self.setCurrentData(data)
+            elif self.lineEdit() and label is not None:
                 self.lineEdit().setText(str(label))
+            return
         self._proxy.set_query("")
 
     def clear_items(self) -> None:
@@ -120,17 +129,27 @@ class SearchableComboBox(QComboBox):
 
     def currentData(self, role=Qt.UserRole):  # noqa: N802 — match QComboBox API
         idx = self.currentIndex()
-        if idx < 0:
-            return None
-        src = self._proxy.mapToSource(self._proxy.index(idx, 0))
-        if not src.isValid():
-            return None
-        return self._model.data(src, role)
+        if idx >= 0:
+            src = self._proxy.mapToSource(self._proxy.index(idx, 0))
+            if src.isValid():
+                return self._model.data(src, role)
+
+        # Fallback: match the visible line-edit text to an option label.
+        # Covers typing a full column name without clicking the popup item.
+        if role == Qt.UserRole and self.lineEdit() is not None:
+            text = self.lineEdit().text().strip()
+            if text:
+                for row in range(self._model.rowCount()):
+                    item = self._model.item(row)
+                    if item is not None and item.text() == text:
+                        return item.data(Qt.UserRole)
+        return None
 
     def findData(self, data) -> int:  # noqa: N802
         self._proxy.set_query("")
         for row in range(self._model.rowCount()):
-            if self._model.item(row).data(Qt.UserRole) == data:
+            item_data = self._model.item(row).data(Qt.UserRole)
+            if item_data == data or (item_data is None and data is None):
                 proxy_idx = self._proxy.mapFromSource(self._model.index(row, 0))
                 return proxy_idx.row()
         return -1
@@ -153,10 +172,11 @@ class SearchableMultiSelect(QWidget):
 
     selectionChanged = pyqtSignal()
 
-    def __init__(self, parent=None, *, placeholder: str = "搜索数值列…"):
+    def __init__(self, parent=None, *, placeholder: str = "搜索数值列…", empty_summary: str = "未选择"):
         super().__init__(parent)
         self._items: List[tuple] = []  # (label, data)
         self._block = False
+        self._empty_summary = empty_summary
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -185,7 +205,7 @@ class SearchableMultiSelect(QWidget):
 
         self.lbl_summary = QLineEdit()
         self.lbl_summary.setReadOnly(True)
-        self.lbl_summary.setPlaceholderText("未选择数值列")
+        self.lbl_summary.setPlaceholderText(empty_summary)
         self.lbl_summary.setFocusPolicy(Qt.NoFocus)
         root.addWidget(self.lbl_summary)
 
@@ -224,11 +244,11 @@ class SearchableMultiSelect(QWidget):
         selected = self.selected_labels()
         if not selected:
             self.lbl_summary.setText("")
-            self.lbl_summary.setPlaceholderText("未选择数值列")
+            self.lbl_summary.setPlaceholderText(self._empty_summary)
         elif len(selected) <= 3:
             self.lbl_summary.setText("、".join(selected))
         else:
-            self.lbl_summary.setText(f"已选 {len(selected)} 列：" + "、".join(selected[:3]) + "…")
+            self.lbl_summary.setText(f"已选 {len(selected)} 项：" + "、".join(selected[:3]) + "…")
 
     def selected_data(self) -> List:
         result = []

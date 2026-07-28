@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,21 +50,56 @@ def compute_ecdf(values: np.ndarray, name: str = "全部") -> Optional[GroupECDF
     )
 
 
+def group_value_label(value) -> str:
+    """Display label for one distinct value in a grouping column."""
+    if pd.isna(value):
+        return "缺失"
+    return str(value)
+
+
+def list_group_levels(df: pd.DataFrame, group_col: str) -> List[Tuple[object, str, int]]:
+    """List distinct values in ``group_col`` (equal values → one group).
+
+    Returns a list of ``(raw_value, label, row_count)`` sorted by label
+    (missing values last). This is the definition of「分组列」: rows that
+    share the same value in this column belong to the same group.
+    """
+    if group_col not in df.columns:
+        raise KeyError(f"Column not found: {group_col}")
+
+    levels: List[Tuple[object, str, int]] = []
+    for value, subset in df.groupby(group_col, dropna=False, sort=True):
+        levels.append((value, group_value_label(value), int(len(subset))))
+
+    # Stable, human-friendly order: non-missing labels sorted, then 缺失.
+    levels.sort(key=lambda item: (item[1] == "缺失", item[1]))
+    return levels
+
+
 def compute_grouped_ecdfs(
     df: pd.DataFrame,
     value_col: str,
     group_col: Optional[str] = None,
+    group_values: Optional[Sequence[object]] = None,
 ) -> List[GroupECDF]:
-    """Compute ECDF for all data or each group (single value column)."""
-    return compute_multi_value_ecdfs(df, [value_col], group_col)
+    """Compute ECDF for all data or each equal-value group (single value column)."""
+    return compute_multi_value_ecdfs(df, [value_col], group_col, group_values=group_values)
 
 
 def compute_multi_value_ecdfs(
     df: pd.DataFrame,
     value_cols: List[str],
     group_col: Optional[str] = None,
+    group_values: Optional[Sequence[object]] = None,
 ) -> List[GroupECDF]:
     """Compute ECDFs for one or more value columns, optionally split by group.
+
+    When ``group_col`` is set, rows are partitioned by **equal values** in
+    that column (pandas ``groupby``): each distinct value is one group, and
+    an ECDF is computed from the numeric values within that group only.
+
+    ``group_values`` optionally restricts which distinct values are plotted
+    (same equality rule). ``None`` means all distinct values.
 
     Series naming:
     - 1 value col, no group → "全部"
@@ -83,6 +118,12 @@ def compute_multi_value_ecdfs(
     has_group = bool(group_col) and group_col in df.columns
     results: List[GroupECDF] = []
 
+    allowed = None
+    if has_group and group_values is not None:
+        allowed = list(group_values)
+        if not allowed:
+            return []
+
     for value_col in value_cols:
         if not has_group:
             if multi_values:
@@ -95,7 +136,9 @@ def compute_multi_value_ecdfs(
             continue
 
         for group_name, subset in df.groupby(group_col, dropna=False, sort=True):
-            g_label = "缺失" if pd.isna(group_name) else str(group_name)
+            if allowed is not None and not _value_in_group_selection(group_name, allowed):
+                continue
+            g_label = group_value_label(group_name)
             if multi_values:
                 label = f"{value_col} / {g_label}"
             else:
@@ -105,6 +148,18 @@ def compute_multi_value_ecdfs(
                 results.append(ecdf)
 
     return results
+
+
+def _value_in_group_selection(value, allowed: Sequence[object]) -> bool:
+    """Membership test that treats NaN / NA as equal to themselves."""
+    value_is_na = pd.isna(value)
+    for item in allowed:
+        item_is_na = pd.isna(item)
+        if value_is_na and item_is_na:
+            return True
+        if not value_is_na and not item_is_na and item == value:
+            return True
+    return False
 
 
 def data_x_range(groups: List[GroupECDF]) -> Tuple[float, float]:
