@@ -26,15 +26,13 @@ def main() -> int:
     window = MainWindow()
     # Preload demo data for convenience, but do not plot until the user
     # selects columns and clicks「生成图形」.
-    window.df = generate_demo_dataframe()
-    window.lbl_file.setText("演示数据（内存）")
-    window._populate_columns()
-    window._set_controls_enabled(True)
-    window._clear_plot()
-    window.status.showMessage(
-        f"已加载演示数据 — {len(window.df)} 行。请选择数值列 / 分组列，然后点击「生成图形」。"
+    demo = generate_demo_dataframe()
+    window._apply_dataframe(
+        demo,
+        label="演示数据（内存）",
+        reset_original=True,
+        status_extra="请选择数值列 / 分组列，然后点击「生成图形」。也可先「数据预览」或「异常剔除」。",
     )
-    window._on_column_selection_changed()
     window.show()
     return app.exec_()
 

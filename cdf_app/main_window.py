@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThreadPool
 from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -39,8 +39,10 @@ from .canvas import (
     LAYOUT_OVERLAY,
     ReferenceLine,
 )
+from .data_preview import DataPreviewDialog, OutlierFilterDialog
 from .ecdf import compute_multi_value_ecdfs, data_x_range
 from .widgets import SearchableComboBox, SearchableMultiSelect
+from .workers import FileLoadSignals, FileLoadWorker, file_basename
 
 
 class ReferenceLineDialog(QDialog):
@@ -113,8 +115,13 @@ class MainWindow(QMainWindow):
         self.resize(1180, 720)
 
         self.df: Optional[pd.DataFrame] = None
+        self._df_original: Optional[pd.DataFrame] = None  # before outlier removal
         self.ref_lines: List[ReferenceLine] = []
         self._updating_limits = False
+        self._loading_file = False
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(4)
+        self._file_load_signals: Optional[FileLoadSignals] = None
 
         self._build_ui()
         self._connect_signals()
@@ -142,8 +149,20 @@ class MainWindow(QMainWindow):
         self.lbl_file = QLabel("未加载文件")
         self.lbl_file.setWordWrap(True)
         self.lbl_file.setStyleSheet("color: #666;")
+        data_btns = QHBoxLayout()
+        self.btn_preview = QPushButton("数据预览")
+        self.btn_preview.setToolTip("按需懒加载预览表格（后台线程），不阻塞界面")
+        self.btn_outliers = QPushButton("异常剔除…")
+        self.btn_outliers.setToolTip("按 IQR / Z-Score / 分位数规则剔除异常行")
+        self.btn_restore = QPushButton("还原数据")
+        self.btn_restore.setToolTip("恢复到剔除异常之前的完整数据")
+        self.btn_restore.setEnabled(False)
+        data_btns.addWidget(self.btn_preview)
+        data_btns.addWidget(self.btn_outliers)
         file_layout.addWidget(self.btn_load)
         file_layout.addWidget(self.lbl_file)
+        file_layout.addLayout(data_btns)
+        file_layout.addWidget(self.btn_restore)
         panel_layout.addWidget(file_box)
 
         col_box = QGroupBox("列设置")
@@ -214,8 +233,8 @@ class MainWindow(QMainWindow):
 
         panel_layout.addStretch(1)
         hint = QLabel(
-            "提示：加载数据后勾选一个或多个数值列、可选分组列，"
-            "再点击「生成图形」。列名支持关键词 / 模糊搜索。"
+            "提示：加载数据后可先「数据预览」查看内容，或用「异常剔除」清理极端值；"
+            "再勾选数值列 / 分组列，点击「生成图形」。列名支持关键词 / 模糊搜索。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
@@ -241,6 +260,9 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.btn_load.clicked.connect(self.load_file)
+        self.btn_preview.clicked.connect(self.show_data_preview)
+        self.btn_outliers.clicked.connect(self.filter_outliers)
+        self.btn_restore.clicked.connect(self.restore_original_data)
         self.btn_plot.clicked.connect(self.refresh_plot)
         # Column / layout changes do not auto-plot; user clicks「生成图形」.
         self.cmb_value.selectionChanged.connect(self._on_column_selection_changed)
@@ -268,11 +290,22 @@ class MainWindow(QMainWindow):
             self.btn_clear_refs,
             self.btn_plot,
             self.chk_crosshair,
+            self.btn_preview,
+            self.btn_outliers,
         ):
             w.setEnabled(enabled)
+        self._update_restore_button()
         if enabled and self.chk_auto_x.isChecked():
             self.edit_xmin.setEnabled(False)
             self.edit_xmax.setEnabled(False)
+
+    def _update_restore_button(self) -> None:
+        can_restore = (
+            self.df is not None
+            and self._df_original is not None
+            and len(self.df) != len(self._df_original)
+        )
+        self.btn_restore.setEnabled(bool(can_restore))
 
     def _selected_value_cols(self) -> List:
         return list(self.cmb_value.selected_data())
@@ -327,6 +360,9 @@ class MainWindow(QMainWindow):
         self.canvas.plot_groups([])
 
     def load_file(self) -> None:
+        if self._loading_file:
+            QMessageBox.information(self, "正在加载", "已有文件正在后台加载，请稍候。")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             "打开数据文件",
@@ -335,29 +371,113 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        try:
-            if path.lower().endswith((".xlsx", ".xls")):
-                df = pd.read_excel(path)
-            else:
-                df = pd.read_csv(path)
-        except Exception as exc:  # noqa: BLE001 — show to user
-            QMessageBox.critical(self, "加载失败", str(exc))
-            return
 
+        self._loading_file = True
+        self.btn_load.setEnabled(False)
+        self.status.showMessage(f"正在后台加载 {file_basename(path)} …")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        signals = FileLoadSignals(self)
+        self._file_load_signals = signals
+        signals.finished.connect(self._on_file_loaded)
+        signals.failed.connect(self._on_file_load_failed)
+        worker = FileLoadWorker(path, signals)
+        self._thread_pool.start(worker)
+
+    def _on_file_loaded(self, df: object, path: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self._loading_file = False
+        self.btn_load.setEnabled(True)
+
+        if not isinstance(df, pd.DataFrame):
+            QMessageBox.critical(self, "加载失败", "返回的数据无效。")
+            return
         if df.empty:
             QMessageBox.warning(self, "数据为空", "文件中没有数据行。")
+            self.status.showMessage("加载取消：文件为空。")
             return
 
+        self._apply_dataframe(df, label=file_basename(path), reset_original=True)
+
+    def _on_file_load_failed(self, message: str, path: str) -> None:
+        QApplication.restoreOverrideCursor()
+        self._loading_file = False
+        self.btn_load.setEnabled(True)
+        QMessageBox.critical(self, "加载失败", f"{file_basename(path)}\n{message}")
+        self.status.showMessage("文件加载失败。")
+
+    def _apply_dataframe(
+        self,
+        df: pd.DataFrame,
+        *,
+        label: str,
+        reset_original: bool,
+        status_extra: str = "",
+    ) -> None:
         self.df = df
-        self.lbl_file.setText(Path(path).name)
+        if reset_original:
+            self._df_original = df.copy()
+        self.lbl_file.setText(label)
         self._populate_columns()
         self._set_controls_enabled(True)
         self._clear_plot()
-        self.status.showMessage(
-            f"已加载 {Path(path).name} — {len(df)} 行。"
-            "请勾选数值列 / 选择分组列，然后点击「生成图形」。"
-        )
+        msg = f"已加载 {label} — {len(df)} 行。"
+        if status_extra:
+            msg += status_extra
+        else:
+            msg += "请勾选数值列 / 选择分组列，然后点击「生成图形」。"
+        self.status.showMessage(msg)
         self._on_column_selection_changed()
+
+    def show_data_preview(self) -> None:
+        if self.df is None:
+            QMessageBox.information(self, "尚未加载数据", "请先加载 CSV / Excel 文件。")
+            return
+        dlg = DataPreviewDialog(self.df, self, title=f"数据预览 — {self.lbl_file.text()}")
+        dlg.exec_()
+
+    def filter_outliers(self) -> None:
+        if self.df is None:
+            QMessageBox.information(self, "尚未加载数据", "请先加载 CSV / Excel 文件。")
+            return
+        preferred = self._selected_value_cols()
+        dlg = OutlierFilterDialog(self.df, self, preferred_cols=preferred)
+        if dlg.exec_() != QDialog.Accepted or dlg.result is None:
+            return
+        result = dlg.result
+        # Keep original snapshot for「还原数据」
+        if self._df_original is None:
+            self._df_original = self.df.copy()
+        label = self.lbl_file.text() or "当前数据"
+        if "（已剔除异常）" not in label:
+            label = f"{label}（已剔除异常）"
+        self._apply_dataframe(
+            result.cleaned,
+            label=label,
+            reset_original=False,
+            status_extra=(
+                f"已按规则剔除 {result.n_removed} 行，剩余 {result.n_kept} 行。"
+                "可点击「还原数据」恢复。"
+            ),
+        )
+        QMessageBox.information(
+            self,
+            "剔除完成",
+            f"已剔除 {result.n_removed} / {result.n_total} 行，"
+            f"当前剩余 {result.n_kept} 行。",
+        )
+
+    def restore_original_data(self) -> None:
+        if self._df_original is None:
+            QMessageBox.information(self, "无法还原", "没有可还原的原始数据。")
+            return
+        label = self.lbl_file.text().replace("（已剔除异常）", "") or "原始数据"
+        self._apply_dataframe(
+            self._df_original.copy(),
+            label=label,
+            reset_original=True,
+            status_extra="已还原为剔除前的完整数据。",
+        )
 
     def _populate_columns(self) -> None:
         assert self.df is not None
