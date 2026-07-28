@@ -29,7 +29,12 @@ class GroupECDF:
 
 
 def compute_ecdf(values: np.ndarray, name: str = "全部") -> Optional[GroupECDF]:
-    """Compute step-function ECDF for a 1-D numeric array."""
+    """Compute step-function ECDF for a 1-D numeric array.
+
+    Plot arrays ``x`` / ``y`` are compressed to unique observation values
+    (mathematically identical step CDF, fewer vertices). ``raw`` keeps the
+    full sorted sample for accurate ``cdf_at`` lookups.
+    """
     arr = np.asarray(values, dtype=float)
     arr = arr[~np.isnan(arr)]
     if arr.size == 0:
@@ -37,17 +42,44 @@ def compute_ecdf(values: np.ndarray, name: str = "全部") -> Optional[GroupECDF
 
     sorted_vals = np.sort(arr)
     n = int(sorted_vals.size)
-    y = np.arange(1, n + 1, dtype=float) / n
+    # One vertex per unique value — identical where="post" step shape.
+    x_plot, counts = np.unique(sorted_vals, return_counts=True)
+    y_plot = np.cumsum(counts, dtype=float) / n
 
     return GroupECDF(
         name=str(name),
-        x=sorted_vals,
-        y=y,
+        x=x_plot,
+        y=y_plot,
         n=n,
         mean=float(np.mean(sorted_vals)),
         std=float(np.std(sorted_vals, ddof=1)) if n > 1 else 0.0,
         raw=sorted_vals,
     )
+
+
+def downsample_step_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_points: int = 4000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Thin a monotone step series for display when N is very large.
+
+    Keeps endpoints and evenly spaced interior samples so the ECDF shape
+    stays visually faithful while Agg has far fewer path vertices.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    n = int(x.size)
+    if n <= max_points or max_points < 3:
+        return x, y
+    idx = np.linspace(0, n - 1, max_points, dtype=int)
+    # Ensure strictly increasing indices (linspace can repeat for tiny n ratios)
+    idx = np.unique(idx)
+    if idx[0] != 0:
+        idx = np.concatenate(([0], idx))
+    if idx[-1] != n - 1:
+        idx = np.concatenate((idx, [n - 1]))
+    return x[idx], y[idx]
 
 
 def compute_grouped_ecdfs(
