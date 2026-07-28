@@ -24,12 +24,17 @@ def main() -> int:
     app.setFont(font)
 
     window = MainWindow()
-    # Load demo data so the app is usable immediately
+    # Preload demo data for convenience, but do not plot until the user
+    # selects columns and clicks「生成图形」.
     window.df = generate_demo_dataframe()
     window.lbl_file.setText("演示数据（内存）")
     window._populate_columns()
     window._set_controls_enabled(True)
-    window.refresh_plot()
+    window._clear_plot()
+    window.status.showMessage(
+        f"已加载演示数据 — {len(window.df)} 行。请选择数值列 / 分组列，然后点击「生成图形」。"
+    )
+    window._on_column_selection_changed()
     window.show()
     return app.exec_()
 

@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         )
         layout_row.addWidget(self.cmb_layout, 1)
 
-        self.btn_plot = QPushButton("更新图形")
+        self.btn_plot = QPushButton("生成图形")
         self.btn_plot.setDefault(True)
         opt_layout.addWidget(self.chk_crosshair)
         opt_layout.addLayout(layout_row)
@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(opt_box)
 
         panel_layout.addStretch(1)
-        hint = QLabel("提示：在图上移动鼠标，可查看数值 x 与累积比例 F(x)。")
+        hint = QLabel("提示：加载数据后先选择数值列 / 分组列，再点击「生成图形」。在图上移动鼠标可查看 x 与 F(x)。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
         panel_layout.addWidget(hint)
@@ -236,9 +236,10 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.btn_load.clicked.connect(self.load_file)
         self.btn_plot.clicked.connect(self.refresh_plot)
-        self.cmb_value.currentIndexChanged.connect(self.refresh_plot)
-        self.cmb_group.currentIndexChanged.connect(self.refresh_plot)
-        self.cmb_layout.currentIndexChanged.connect(self.refresh_plot)
+        # Column / layout changes do not auto-plot; user clicks「生成图形」.
+        self.cmb_value.currentIndexChanged.connect(self._on_column_selection_changed)
+        self.cmb_group.currentIndexChanged.connect(self._on_column_selection_changed)
+        self.cmb_layout.currentIndexChanged.connect(self._on_column_selection_changed)
         self.btn_apply_x.clicked.connect(self.apply_x_range)
         self.chk_auto_x.toggled.connect(self._on_auto_x_toggled)
         self.btn_add_ref.clicked.connect(self.add_reference_line)
@@ -271,13 +272,45 @@ class MainWindow(QMainWindow):
         if text:
             self.status.showMessage(text)
         elif self.df is not None:
-            self.status.showMessage(f"就绪 — {len(self.df)} 行")
+            self.status.showMessage(f"已加载 — {len(self.df)} 行（选择列后点击「生成图形」）")
 
     def _on_auto_x_toggled(self, checked: bool) -> None:
         self.edit_xmin.setEnabled(not checked)
         self.edit_xmax.setEnabled(not checked)
-        if checked:
+        # Only re-apply limits if a plot already exists
+        if checked and self.canvas._groups:
             self.apply_x_range()
+
+    def _on_column_selection_changed(self) -> None:
+        """Update control hints when columns change; do not plot yet."""
+        if self.df is None:
+            return
+        value_col = self.cmb_value.currentData()
+        group_col = self.cmb_group.currentData()
+        n_rows = len(self.df)
+        if value_col is None:
+            self.status.showMessage(f"已加载 — {n_rows} 行。请选择数值列，再点击「生成图形」。")
+            self.cmb_layout.setEnabled(False)
+            return
+        # Peek at group count so layout combo can be enabled appropriately
+        try:
+            groups = compute_grouped_ecdfs(self.df, value_col, group_col)
+            n_groups = len(groups)
+        except Exception:  # noqa: BLE001
+            n_groups = 0
+        self.cmb_layout.setEnabled(n_groups > 1)
+        group_note = f"，分组列={group_col}" if group_col else "，不分组"
+        self.status.showMessage(
+            f"已加载 — {n_rows} 行，数值列={value_col}{group_note}"
+            f"（约 {n_groups} 组）。点击「生成图形」开始绘图。"
+        )
+
+    def _clear_plot(self) -> None:
+        """Reset the canvas to an empty state (no series)."""
+        self.canvas.set_layout_mode(LAYOUT_OVERLAY, redraw=False)
+        self.canvas.set_axis_labels(xlabel="数值", ylabel="ratio", title="CDF")
+        self.canvas.set_reference_lines(self.ref_lines, redraw=False)
+        self.canvas.plot_groups([])
 
     def load_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -305,7 +338,12 @@ class MainWindow(QMainWindow):
         self.lbl_file.setText(Path(path).name)
         self._populate_columns()
         self._set_controls_enabled(True)
-        self.refresh_plot()
+        self._clear_plot()
+        self.status.showMessage(
+            f"已加载 {Path(path).name} — {len(df)} 行。"
+            "请选择数值列 / 分组列，然后点击「生成图形」。"
+        )
+        self._on_column_selection_changed()
 
     def _populate_columns(self) -> None:
         assert self.df is not None
@@ -318,30 +356,29 @@ class MainWindow(QMainWindow):
         self.cmb_group.blockSignals(True)
         self.cmb_value.clear()
         self.cmb_group.clear()
+        # Placeholders: user must choose columns before generating the plot
+        self.cmb_value.addItem("（请选择数值列）", None)
         self.cmb_group.addItem("（无）", None)
         for c in numeric_cols:
             self.cmb_value.addItem(str(c), c)
         for c in all_cols:
             self.cmb_group.addItem(c, c)
+        self.cmb_value.setCurrentIndex(0)
+        self.cmb_group.setCurrentIndex(0)
         self.cmb_value.blockSignals(False)
         self.cmb_group.blockSignals(False)
 
-        if self.cmb_value.count() == 0:
+        if len(numeric_cols) == 0:
             QMessageBox.warning(self, "无数值列", "未找到可用的数值列。")
             self._set_controls_enabled(False)
             return
-
-        # Heuristic: first numeric as value; first non-numeric as group if present
-        non_numeric = [c for c in all_cols if c not in numeric_cols]
-        if non_numeric:
-            idx = self.cmb_group.findData(non_numeric[0])
-            if idx >= 0:
-                self.cmb_group.setCurrentIndex(idx)
 
     def _current_groups(self):
         if self.df is None or self.cmb_value.count() == 0:
             return []
         value_col = self.cmb_value.currentData()
+        if value_col is None:
+            return []
         group_col = self.cmb_group.currentData()
         try:
             return compute_grouped_ecdfs(self.df, value_col, group_col)
@@ -350,11 +387,25 @@ class MainWindow(QMainWindow):
             return []
 
     def refresh_plot(self) -> None:
+        if self.df is None:
+            QMessageBox.information(self, "尚未加载数据", "请先加载 CSV / Excel 文件。")
+            return
+        value_col = self.cmb_value.currentData()
+        if value_col is None:
+            QMessageBox.information(
+                self,
+                "请选择列",
+                "请先选择数值列（可选分组列），然后再生成图形。",
+            )
+            return
+
         groups = self._current_groups()
-        value_col = self.cmb_value.currentData() or "数值"
+        if not groups:
+            QMessageBox.warning(self, "无有效数据", "所选列没有可用于绘图的数值。")
+            return
+
         layout_mode = self.cmb_layout.currentData() or LAYOUT_OVERLAY
-        # Layout choice only matters when there are multiple groups
-        self.cmb_layout.setEnabled(self.df is not None and len(groups) > 1)
+        self.cmb_layout.setEnabled(len(groups) > 1)
 
         self.canvas.set_layout_mode(layout_mode, redraw=False)
         self.canvas.set_axis_labels(
@@ -364,22 +415,21 @@ class MainWindow(QMainWindow):
         )
         self.canvas.set_reference_lines(self.ref_lines, redraw=False)
 
-        if groups:
-            lo, hi = data_x_range(groups)
-            pad = (hi - lo) * 0.03
-            auto_lo, auto_hi = lo - pad, hi + pad
-            if self.chk_auto_x.isChecked():
-                self._updating_limits = True
-                self.edit_xmin.setText(f"{auto_lo:.6g}")
-                self.edit_xmax.setText(f"{auto_hi:.6g}")
-                self._updating_limits = False
-                self.canvas.set_x_limits(auto_lo, auto_hi, redraw=False)
-            else:
-                self._apply_x_limits_from_edits(redraw=False)
+        lo, hi = data_x_range(groups)
+        pad = (hi - lo) * 0.03
+        auto_lo, auto_hi = lo - pad, hi + pad
+        if self.chk_auto_x.isChecked():
+            self._updating_limits = True
+            self.edit_xmin.setText(f"{auto_lo:.6g}")
+            self.edit_xmax.setText(f"{auto_hi:.6g}")
+            self._updating_limits = False
+            self.canvas.set_x_limits(auto_lo, auto_hi, redraw=False)
+        else:
+            self._apply_x_limits_from_edits(redraw=False)
 
         self.canvas.plot_groups(groups)
         n_groups = len(groups)
-        n_rows = 0 if self.df is None else len(self.df)
+        n_rows = len(self.df)
         layout_note = ""
         if n_groups > 1:
             labels = {
@@ -388,7 +438,7 @@ class MainWindow(QMainWindow):
                 LAYOUT_MULTI: "多图",
             }
             layout_note = f"，布局={labels.get(layout_mode, layout_mode)}"
-        self.status.showMessage(f"就绪 — {n_rows} 行，{n_groups} 组{layout_note}")
+        self.status.showMessage(f"已生成 — {n_rows} 行，{n_groups} 组{layout_note}")
 
     def _apply_x_limits_from_edits(self, *, redraw: bool) -> bool:
         try:
