@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -11,7 +12,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from PyQt5.QtCore import pyqtSignal
 
-from .ecdf import GroupECDF, proportions_at, stats_legend_text
+from .ecdf import GroupECDF, downsample_step_xy, proportions_at, stats_legend_text
 from .fonts import configure_matplotlib_fonts
 
 # Ensure CJK glyphs render on titles / legends / annotations.
@@ -33,6 +34,11 @@ COLORS = [
 LAYOUT_OVERLAY = "overlay"  # all series on one axes
 LAYOUT_GRID = "grid"  # subplot grid inside one figure
 LAYOUT_MULTI = "multi"  # one axes per group (stacked / separate panels)
+
+# Interactive / rendering budgets for large samples.
+MARKER_POINT_LIMIT = 400  # skip per-point markers above this
+PLOT_POINT_LIMIT = 4000  # downsample step vertices above this
+MOTION_MIN_INTERVAL_S = 1.0 / 60.0  # cap crosshair updates ~60 Hz
 
 
 def grid_shape(n: int) -> Tuple[int, int]:
@@ -78,9 +84,13 @@ class CDFCanvas(FigureCanvas):
         # Crosshair artists are per-axes (ax -> (vline, hline, annot))
         self._crosshairs: dict = {}
         self._crosshair_enabled = True
+        # Blit background: full-figure snapshot without animated crosshair artists
+        self._background = None
+        self._last_motion_ts = 0.0
 
         self.mpl_connect("motion_notify_event", self._on_motion)
         self.mpl_connect("axes_leave_event", self._on_leave)
+        self.mpl_connect("draw_event", self._on_draw_event)
         self._style_axes(self.ax)
 
     def _style_axes(self, ax, *, title: Optional[str] = None) -> None:
@@ -104,7 +114,7 @@ class CDFCanvas(FigureCanvas):
         self._crosshair_enabled = enabled
         if not enabled:
             self._hide_crosshair()
-            self.draw_idle()
+            self._blit_crosshairs()
 
     def set_axis_labels(self, xlabel: str, ylabel: str, title: str) -> None:
         self._xlabel = xlabel
@@ -132,6 +142,7 @@ class CDFCanvas(FigureCanvas):
         self.fig.clear()
         self._axes = []
         self._crosshairs.clear()
+        self._background = None
         self.ax = None
 
     def _make_axes(self, n_panels: int) -> List:
@@ -168,15 +179,20 @@ class CDFCanvas(FigureCanvas):
         return self._axes
 
     def _draw_group_on_ax(self, ax, group: GroupECDF, color: str, *, with_legend: bool) -> None:
+        x, y = downsample_step_xy(group.x, group.y, max_points=PLOT_POINT_LIMIT)
+        rasterize = int(x.size) >= PLOT_POINT_LIMIT
         ax.step(
-            group.x,
-            group.y,
+            x,
+            y,
             where="post",
             color=color,
             linewidth=1.8,
             label=stats_legend_text(group),
+            rasterized=rasterize,
         )
-        ax.plot(group.x, group.y, "o", color=color, markersize=3, alpha=0.55)
+        # Markers become a solid blur and dominate redraw cost on large N.
+        if int(group.x.size) <= MARKER_POINT_LIMIT:
+            ax.plot(group.x, group.y, "o", color=color, markersize=3, alpha=0.55)
         ax.axvline(group.mean, color=color, linestyle=":", alpha=0.35, linewidth=1.0)
         if with_legend:
             legend = ax.legend(
@@ -277,11 +293,24 @@ class CDFCanvas(FigureCanvas):
             pass
         self.draw_idle()
 
+    def _on_draw_event(self, _event) -> None:
+        """Cache a clean background after every full canvas draw (for blitting)."""
+        try:
+            self._background = self.copy_from_bbox(self.fig.bbox)
+        except Exception:  # noqa: BLE001 — renderer may not be ready yet
+            self._background = None
+
     def _ensure_crosshair(self, ax) -> Tuple[Line2D, Line2D, object]:
         if ax in self._crosshairs:
             return self._crosshairs[ax]
-        vline = ax.axvline(0, color="#333333", linewidth=0.9, alpha=0.75, visible=False, zorder=20)
-        hline = ax.axhline(0, color="#333333", linewidth=0.9, alpha=0.75, visible=False, zorder=20)
+        # animated=True excludes these from normal draws so the blit background
+        # stays clean; we composite them via draw_artist + blit on motion.
+        vline = ax.axvline(
+            0, color="#333333", linewidth=0.9, alpha=0.75, visible=False, zorder=20, animated=True
+        )
+        hline = ax.axhline(
+            0, color="#333333", linewidth=0.9, alpha=0.75, visible=False, zorder=20, animated=True
+        )
         annot = ax.annotate(
             "",
             xy=(0, 0),
@@ -291,6 +320,7 @@ class CDFCanvas(FigureCanvas):
             fontsize=8,
             visible=False,
             zorder=30,
+            animated=True,
         )
         self._crosshairs[ax] = (vline, hline, annot)
         return vline, hline, annot
@@ -302,9 +332,31 @@ class CDFCanvas(FigureCanvas):
             annot.set_visible(False)
         self.cursor_info.emit("")
 
+    def _blit_crosshairs(self) -> None:
+        """Restore cached background and redraw only animated crosshair artists."""
+        if self._background is None:
+            # No cache yet — fall back to a full (idle) draw once.
+            self.draw_idle()
+            return
+        try:
+            self.restore_region(self._background)
+            for ax, (vline, hline, annot) in self._crosshairs.items():
+                if not ax.get_visible():
+                    continue
+                if vline.get_visible():
+                    ax.draw_artist(vline)
+                if hline.get_visible():
+                    ax.draw_artist(hline)
+                if annot.get_visible():
+                    ax.draw_artist(annot)
+            self.blit(self.fig.bbox)
+        except Exception:  # noqa: BLE001 — e.g. stale background after resize
+            self._background = None
+            self.draw_idle()
+
     def _on_leave(self, _event) -> None:
         self._hide_crosshair()
-        self.draw_idle()
+        self._blit_crosshairs()
 
     def _groups_for_axes(self, ax) -> List[GroupECDF]:
         """Groups shown on a given axes (all in overlay; one in panel modes)."""
@@ -327,6 +379,11 @@ class CDFCanvas(FigureCanvas):
             return
         if event.xdata is None or event.ydata is None:
             return
+
+        now = time.perf_counter()
+        if now - self._last_motion_ts < MOTION_MIN_INTERVAL_S:
+            return
+        self._last_motion_ts = now
 
         ax = event.inaxes
         x, y = float(event.xdata), float(event.ydata)
@@ -365,4 +422,4 @@ class CDFCanvas(FigureCanvas):
         annot.set_position((offset_x, offset_y))
 
         self.cursor_info.emit(text.replace("\n", "  |  "))
-        self.draw_idle()
+        self._blit_crosshairs()
