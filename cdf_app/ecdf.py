@@ -91,9 +91,9 @@ def stats_legend_text(group: GroupECDF) -> str:
     """Legend label with N / Mean / StDev (Minitab-style)."""
     return (
         f"{group.name}\n"
-        f"  样本量 N = {group.n}\n"
-        f"  均值 = {group.mean:.4g}\n"
-        f"  标准差 = {group.std:.4g}"
+        f"  N = {group.n}\n"
+        f"  MEAN = {group.mean:.4g}\n"
+        f"  S.D. = {group.std:.4g}"
     )
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from PyQt5.QtWidgets import QApplication
-
+from PyQt5.QtGui import QFont
 from cdf_app.main_window import MainWindow, generate_demo_dataframe
 
 
@@ -13,6 +13,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("CDF 图")
     app.setStyle("Fusion")
+    
+    font = QFont("Microsoft YaHei", 9)
+    app.setFont(font)
 
     window = MainWindow()
     # Load demo data so the app is usable immediately

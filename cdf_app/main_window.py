@@ -330,8 +330,8 @@ class MainWindow(QMainWindow):
         value_col = self.cmb_value.currentData() or "数值"
         self.canvas.set_axis_labels(
             xlabel=str(value_col),
-            ylabel="累积比例",
-            title="经验累积分布函数（CDF）",
+            ylabel="ratio",
+            title="CDF",
         )
         self.canvas.set_reference_lines(self.ref_lines, redraw=False)
 
