@@ -32,7 +32,13 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .canvas import CDFCanvas, ReferenceLine
+from .canvas import (
+    CDFCanvas,
+    LAYOUT_GRID,
+    LAYOUT_MULTI,
+    LAYOUT_OVERLAY,
+    ReferenceLine,
+)
 from .ecdf import compute_grouped_ecdfs, data_x_range
 
 
@@ -181,9 +187,25 @@ class MainWindow(QMainWindow):
         opt_layout = QVBoxLayout(opt_box)
         self.chk_crosshair = QCheckBox("十字定位线（数值 + 比例）")
         self.chk_crosshair.setChecked(True)
+
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("多组布局:"))
+        self.cmb_layout = QComboBox()
+        self.cmb_layout.addItem("叠加同一图", LAYOUT_OVERLAY)
+        self.cmb_layout.addItem("网格分布（一张图）", LAYOUT_GRID)
+        self.cmb_layout.addItem("多图显示（每组一图）", LAYOUT_MULTI)
+        self.cmb_layout.setToolTip(
+            "分组后有多组数据时：\n"
+            "· 叠加同一图：所有组画在同一坐标系\n"
+            "· 网格分布：在一张图内按网格分面\n"
+            "· 多图显示：每组单独一张图（纵向排列）"
+        )
+        layout_row.addWidget(self.cmb_layout, 1)
+
         self.btn_plot = QPushButton("更新图形")
         self.btn_plot.setDefault(True)
         opt_layout.addWidget(self.chk_crosshair)
+        opt_layout.addLayout(layout_row)
         opt_layout.addWidget(self.btn_plot)
         panel_layout.addWidget(opt_box)
 
@@ -216,6 +238,7 @@ class MainWindow(QMainWindow):
         self.btn_plot.clicked.connect(self.refresh_plot)
         self.cmb_value.currentIndexChanged.connect(self.refresh_plot)
         self.cmb_group.currentIndexChanged.connect(self.refresh_plot)
+        self.cmb_layout.currentIndexChanged.connect(self.refresh_plot)
         self.btn_apply_x.clicked.connect(self.apply_x_range)
         self.chk_auto_x.toggled.connect(self._on_auto_x_toggled)
         self.btn_add_ref.clicked.connect(self.add_reference_line)
@@ -228,6 +251,7 @@ class MainWindow(QMainWindow):
         for w in (
             self.cmb_value,
             self.cmb_group,
+            self.cmb_layout,
             self.edit_xmin,
             self.edit_xmax,
             self.chk_auto_x,
@@ -328,6 +352,11 @@ class MainWindow(QMainWindow):
     def refresh_plot(self) -> None:
         groups = self._current_groups()
         value_col = self.cmb_value.currentData() or "数值"
+        layout_mode = self.cmb_layout.currentData() or LAYOUT_OVERLAY
+        # Layout choice only matters when there are multiple groups
+        self.cmb_layout.setEnabled(self.df is not None and len(groups) > 1)
+
+        self.canvas.set_layout_mode(layout_mode, redraw=False)
         self.canvas.set_axis_labels(
             xlabel=str(value_col),
             ylabel="ratio",
@@ -351,7 +380,15 @@ class MainWindow(QMainWindow):
         self.canvas.plot_groups(groups)
         n_groups = len(groups)
         n_rows = 0 if self.df is None else len(self.df)
-        self.status.showMessage(f"就绪 — {n_rows} 行，{n_groups} 组")
+        layout_note = ""
+        if n_groups > 1:
+            labels = {
+                LAYOUT_OVERLAY: "叠加",
+                LAYOUT_GRID: "网格",
+                LAYOUT_MULTI: "多图",
+            }
+            layout_note = f"，布局={labels.get(layout_mode, layout_mode)}"
+        self.status.showMessage(f"就绪 — {n_rows} 行，{n_groups} 组{layout_note}")
 
     def _apply_x_limits_from_edits(self, *, redraw: bool) -> bool:
         try:
