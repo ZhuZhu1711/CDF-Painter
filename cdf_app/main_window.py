@@ -40,7 +40,7 @@ from .canvas import (
     ReferenceLine,
 )
 from .data_preview import DataPreviewDialog, OutlierFilterDialog
-from .ecdf import compute_multi_value_ecdfs, data_x_range
+from .ecdf import compute_multi_value_ecdfs, data_x_range, list_group_levels
 from .widgets import SearchableComboBox, SearchableMultiSelect
 from .workers import FileLoadSignals, FileLoadWorker, file_basename
 
@@ -168,11 +168,36 @@ class MainWindow(QMainWindow):
         col_box = QGroupBox("列设置")
         col_layout = QVBoxLayout(col_box)
         col_layout.addWidget(QLabel("数值列（可多选，支持搜索）:"))
-        self.cmb_value = SearchableMultiSelect(placeholder="输入关键词筛选数值列…")
+        self.cmb_value = SearchableMultiSelect(
+            placeholder="输入关键词筛选数值列…",
+            empty_summary="未选择数值列",
+        )
         col_layout.addWidget(self.cmb_value)
-        col_layout.addWidget(QLabel("分组列（可选，支持搜索）:"))
+
+        group_label = QLabel("分组列（可选）:")
+        group_label.setToolTip(
+            "指定一列后，该列取值相同的行归为同一组，每组各自计算 CDF。\n"
+            "例如分组列=Line 且有 Line-A / Line-B，则分别绘制两组曲线。"
+        )
+        col_layout.addWidget(group_label)
         self.cmb_group = SearchableComboBox(placeholder="搜索分组列，或选「无」…")
+        self.cmb_group.setToolTip(group_label.toolTip())
         col_layout.addWidget(self.cmb_group)
+
+        self.lbl_group_levels = QLabel("分组取值（相同值=一组，可多选）:")
+        self.lbl_group_levels.setToolTip(
+            "根据分组列自动列出所有不同取值；勾选要绘制的组。"
+        )
+        self.cmb_group_levels = SearchableMultiSelect(
+            placeholder="搜索分组取值…",
+            empty_summary="未选择分组取值",
+        )
+        self.cmb_group_levels.list.setMaximumHeight(140)
+        self.cmb_group_levels.list.setMinimumHeight(80)
+        self.lbl_group_levels.setVisible(False)
+        self.cmb_group_levels.setVisible(False)
+        col_layout.addWidget(self.lbl_group_levels)
+        col_layout.addWidget(self.cmb_group_levels)
         panel_layout.addWidget(col_box)
 
         axis_box = QGroupBox("横坐标范围")
@@ -217,7 +242,7 @@ class MainWindow(QMainWindow):
         self.cmb_layout.addItem("网格分布（一张图）", LAYOUT_GRID)
         self.cmb_layout.addItem("多图显示（每组一图）", LAYOUT_MULTI)
         self.cmb_layout.setToolTip(
-            "分组后有多组数据时：\n"
+            "按分组列拆成多组之后，如何排布这些组的曲线：\n"
             "· 叠加同一图：所有组画在同一坐标系\n"
             "· 网格分布：在一张图内按网格分面\n"
             "· 多图显示：每组单独一张图（纵向排列）"
@@ -233,8 +258,8 @@ class MainWindow(QMainWindow):
 
         panel_layout.addStretch(1)
         hint = QLabel(
-            "提示：加载数据后可先「数据预览」查看内容，或用「异常剔除」清理极端值；"
-            "再勾选数值列 / 分组列，点击「生成图形」。列名支持关键词 / 模糊搜索。"
+            "提示：加载数据后可先「数据预览」或「异常剔除」；再勾选数值列，"
+            "可选指定分组列（同值归一组），勾选要绘制的分组取值，最后点「生成图形」。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
@@ -266,7 +291,8 @@ class MainWindow(QMainWindow):
         self.btn_plot.clicked.connect(self.refresh_plot)
         # Column / layout changes do not auto-plot; user clicks「生成图形」.
         self.cmb_value.selectionChanged.connect(self._on_column_selection_changed)
-        self.cmb_group.currentIndexChanged.connect(self._on_column_selection_changed)
+        self.cmb_group.currentIndexChanged.connect(self._on_group_column_changed)
+        self.cmb_group_levels.selectionChanged.connect(self._on_column_selection_changed)
         self.cmb_layout.currentIndexChanged.connect(self._on_column_selection_changed)
         self.btn_apply_x.clicked.connect(self.apply_x_range)
         self.chk_auto_x.toggled.connect(self._on_auto_x_toggled)
@@ -280,6 +306,7 @@ class MainWindow(QMainWindow):
         for w in (
             self.cmb_value,
             self.cmb_group,
+            self.cmb_group_levels,
             self.cmb_layout,
             self.edit_xmin,
             self.edit_xmax,
@@ -313,6 +340,12 @@ class MainWindow(QMainWindow):
     def _selected_group_col(self):
         return self.cmb_group.currentData()
 
+    def _selected_group_values(self) -> Optional[List]:
+        """Selected distinct values of the grouping column, or None if not grouping."""
+        if not self._selected_group_col():
+            return None
+        return list(self.cmb_group_levels.selected_data())
+
     def _on_cursor_info(self, text: str) -> None:
         if text:
             self.status.showMessage(text)
@@ -326,19 +359,50 @@ class MainWindow(QMainWindow):
         if checked and self.canvas._groups:
             self.apply_x_range()
 
+    def _on_group_column_changed(self) -> None:
+        """Rebuild the equal-value group checklist when the grouping column changes."""
+        self._refresh_group_levels()
+        self._on_column_selection_changed()
+
+    def _refresh_group_levels(self) -> None:
+        """Populate「分组取值」from distinct values of the selected grouping column."""
+        group_col = self._selected_group_col()
+        if self.df is None or not group_col:
+            self.cmb_group_levels.clear_options()
+            self.lbl_group_levels.setVisible(False)
+            self.cmb_group_levels.setVisible(False)
+            return
+
+        levels = list_group_levels(self.df, group_col)
+        # Label shows value and row count so users see “同值=一组”.
+        options = [(f"{label}（{count} 行）", value) for value, label, count in levels]
+        self.cmb_group_levels.set_options(options)
+        self.cmb_group_levels.set_selected_data([value for value, _label, _count in levels])
+        self.lbl_group_levels.setVisible(True)
+        self.cmb_group_levels.setVisible(True)
+
     def _on_column_selection_changed(self) -> None:
         """Update control hints when columns change; do not plot yet."""
         if self.df is None:
             return
         value_cols = self._selected_value_cols()
         group_col = self._selected_group_col()
+        group_values = self._selected_group_values()
         n_rows = len(self.df)
         if not value_cols:
             self.status.showMessage(f"已加载 — {n_rows} 行。请勾选数值列，再点击「生成图形」。")
             self.cmb_layout.setEnabled(False)
             return
+        if group_col and not group_values:
+            self.status.showMessage(
+                f"已加载 — {n_rows} 行，分组列={group_col}，但未勾选任何分组取值。"
+            )
+            self.cmb_layout.setEnabled(False)
+            return
         try:
-            groups = compute_multi_value_ecdfs(self.df, value_cols, group_col)
+            groups = compute_multi_value_ecdfs(
+                self.df, value_cols, group_col, group_values=group_values
+            )
             n_groups = len(groups)
         except Exception:  # noqa: BLE001
             n_groups = 0
@@ -346,10 +410,14 @@ class MainWindow(QMainWindow):
         cols_note = "、".join(str(c) for c in value_cols[:3])
         if len(value_cols) > 3:
             cols_note += f" 等 {len(value_cols)} 列"
-        group_note = f"，分组列={group_col}" if group_col else "，不分组"
+        if group_col:
+            n_levels = len(group_values or [])
+            group_note = f"，分组列={group_col}（按同值分为 {n_levels} 组）"
+        else:
+            group_note = "，不分组"
         self.status.showMessage(
             f"已加载 — {n_rows} 行，数值列={cols_note}{group_note}"
-            f"（约 {n_groups} 组）。点击「生成图形」开始绘图。"
+            f"（将绘制 {n_groups} 条曲线）。点击「生成图形」开始绘图。"
         )
 
     def _clear_plot(self) -> None:
@@ -488,8 +556,11 @@ class MainWindow(QMainWindow):
 
         self.cmb_value.set_options([(str(c), c) for c in numeric_cols])
         group_options = [("（无）", None)] + [(str(c), c) for c in all_cols]
+        self.cmb_group.blockSignals(True)
         self.cmb_group.set_options(group_options)
         self.cmb_group.setCurrentData(None)
+        self.cmb_group.blockSignals(False)
+        self._refresh_group_levels()
 
         if len(numeric_cols) == 0:
             QMessageBox.warning(self, "无数值列", "未找到可用的数值列。")
@@ -503,8 +574,13 @@ class MainWindow(QMainWindow):
         if not value_cols:
             return []
         group_col = self._selected_group_col()
+        group_values = self._selected_group_values()
+        if group_col and not group_values:
+            return []
         try:
-            return compute_multi_value_ecdfs(self.df, value_cols, group_col)
+            return compute_multi_value_ecdfs(
+                self.df, value_cols, group_col, group_values=group_values
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "绘图错误", str(exc))
             return []
@@ -518,7 +594,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "请选择列",
-                "请先勾选至少一个数值列（可选分组列），然后再生成图形。",
+                "请先勾选至少一个数值列；如需按列分组，再选择分组列"
+                "（同值归一组）并勾选分组取值，然后生成图形。",
+            )
+            return
+
+        group_col = self._selected_group_col()
+        if group_col and not self._selected_group_values():
+            QMessageBox.information(
+                self,
+                "请选择分组取值",
+                f"已选择分组列「{group_col}」。请在「分组取值」中勾选至少一个"
+                "取值（相同取值的行会分到同一组）。",
             )
             return
 
@@ -566,8 +653,13 @@ class MainWindow(QMainWindow):
                 LAYOUT_MULTI: "多图",
             }
             layout_note = f"，布局={labels.get(layout_mode, layout_mode)}"
+        if group_col:
+            group_note = f"，按「{group_col}」同值分组"
+        else:
+            group_note = ""
         self.status.showMessage(
-            f"已生成 — {n_rows} 行，{len(value_cols)} 个数值列，{n_groups} 组{layout_note}"
+            f"已生成 — {n_rows} 行，{len(value_cols)} 个数值列，"
+            f"{n_groups} 条曲线{group_note}{layout_note}"
         )
 
     def _apply_x_limits_from_edits(self, *, redraw: bool) -> bool:
