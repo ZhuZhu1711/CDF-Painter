@@ -55,22 +55,55 @@ def compute_grouped_ecdfs(
     value_col: str,
     group_col: Optional[str] = None,
 ) -> List[GroupECDF]:
-    """Compute ECDF for all data or each group."""
-    if value_col not in df.columns:
-        raise KeyError(f"Column not found: {value_col}")
+    """Compute ECDF for all data or each group (single value column)."""
+    return compute_multi_value_ecdfs(df, [value_col], group_col)
 
+
+def compute_multi_value_ecdfs(
+    df: pd.DataFrame,
+    value_cols: List[str],
+    group_col: Optional[str] = None,
+) -> List[GroupECDF]:
+    """Compute ECDFs for one or more value columns, optionally split by group.
+
+    Series naming:
+    - 1 value col, no group → "全部"
+    - 1 value col, with group → group level name
+    - N value cols, no group → column name
+    - N value cols, with group → "{col} / {group}"
+    """
+    if not value_cols:
+        return []
+
+    missing = [c for c in value_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Column not found: {missing[0]}")
+
+    multi_values = len(value_cols) > 1
+    has_group = bool(group_col) and group_col in df.columns
     results: List[GroupECDF] = []
-    if not group_col or group_col not in df.columns:
-        ecdf = compute_ecdf(df[value_col].to_numpy(), name="全部")
-        if ecdf is not None:
-            results.append(ecdf)
-        return results
 
-    for group_name, subset in df.groupby(group_col, dropna=False, sort=True):
-        label = "缺失" if pd.isna(group_name) else str(group_name)
-        ecdf = compute_ecdf(subset[value_col].to_numpy(), name=label)
-        if ecdf is not None:
-            results.append(ecdf)
+    for value_col in value_cols:
+        if not has_group:
+            if multi_values:
+                name = str(value_col)
+            else:
+                name = "全部"
+            ecdf = compute_ecdf(df[value_col].to_numpy(), name=name)
+            if ecdf is not None:
+                results.append(ecdf)
+            continue
+
+        for group_name, subset in df.groupby(group_col, dropna=False, sort=True):
+            g_label = "缺失" if pd.isna(group_name) else str(group_name)
+            if multi_values:
+                label = f"{value_col} / {g_label}"
+            else:
+                label = g_label
+            ecdf = compute_ecdf(subset[value_col].to_numpy(), name=label)
+            if ecdf is not None:
+                results.append(ecdf)
+
     return results
 
 
